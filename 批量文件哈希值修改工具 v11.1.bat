@@ -1,6 +1,6 @@
 ﻿@echo off
 setlocal
-rem Batch File Hash Modifier v11.0 - launcher
+rem Batch File Hash Modifier v11.1 - launcher
 rem Locates the companion .ps1 script in this folder and runs it.
 
 set "PS1="
