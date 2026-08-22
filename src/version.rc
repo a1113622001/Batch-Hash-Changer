@@ -1,0 +1,40 @@
+#include <windows.h>
+
+#define IDI_ICON1 1
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
+#define RT_MANIFEST 24
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     11,1,0,0
+PRODUCTVERSION  11,1,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+FILEFLAGS       VS_FF_DEBUG
+#else
+FILEFLAGS       0x0L
+#endif
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "Batch-Hash-Changer"
+            VALUE "FileDescription",  "批量文件哈希值修改工具 (C语言高性能独立版)"
+            VALUE "FileVersion",      "11.1.0.0"
+            VALUE "InternalName",     "BatchHashChanger"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 MIT License"
+            VALUE "OriginalFilename", "BatchHashChanger.exe"
+            VALUE "ProductName",      "批量文件哈希值修改工具"
+            VALUE "ProductVersion",   "11.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

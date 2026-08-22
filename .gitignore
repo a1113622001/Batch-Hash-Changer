@@ -1,0 +1,10 @@
+﻿# Build outputs
+build/
+bin/
+*.exe
+*.obj
+*.res
+*.7z
+*.zip
+.vscode/
+.idea/
