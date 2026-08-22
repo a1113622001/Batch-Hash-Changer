@@ -18,7 +18,10 @@ typedef struct {
     wchar_t *self_exe_path;      // Executable's own path to exclude
     int      threads;             // Number of threads (0 for auto: min(CPU, 8))
     int      batch_size;          // Batch size (default: 5000)
+    bool     force_all;           // Force modify executable/signed files (.exe, .dll, etc.)
+    bool     format_aware;        // Enable format-aware metadata injection (MP4, PNG, etc.)
     bool     interactive;         // Whether running in interactive console mode
+    bool     pause_on_exit;       // Pause on exit before closing (for drag-and-drop onto icon)
 } HashChangerOptions;
 
 // Statistics of processing
@@ -26,11 +29,12 @@ typedef struct {
     int64_t total_files;
     int64_t ok_count;
     int64_t fail_count;
+    int64_t skipped_count;
     double  elapsed_seconds;
     double  rate_files_per_sec;
 } HashChangerStats;
 
-// File item for LCN sorting and processing
+// File item for processing
 typedef struct {
     wchar_t *path;
     int64_t  lcn;
@@ -38,6 +42,9 @@ typedef struct {
 
 // Check if current process has Administrator privileges
 bool IsRunningAsAdmin(void);
+
+// Check if file is an executable / driver / binary package that shouldn't be altered by default
+bool IsExecutableFile(const wchar_t *file_path);
 
 // Console color helpers (supports ANSI with fallback to Win32 console attributes)
 void ConsoleInit(void);
@@ -55,10 +62,11 @@ void FreeFileItems(FileItem *items, size_t count);
 // 2. Query physical cluster (LCN) of a file; returns -1 on failure
 int64_t GetPhysicalClusterLCN(const wchar_t *file_path);
 
-// 3. Atomically append 1~4 random bytes and freeze/restore FILETIME timestamps
+// 3. Atomically append noise with format-awareness, readonly handling, and timestamp freezing
 bool AppendDataWithFreeze(const wchar_t *file_path);
+bool AppendDataWithFreezeEx(const wchar_t *file_path, bool force_all, bool format_aware, bool *out_skipped);
 
-// 4. Run full batch processing
+// 4. Run streaming Producer-Consumer batch hash changer pipeline
 bool RunBatchHashChanger(const HashChangerOptions *options, HashChangerStats *stats);
 
 #ifdef __cplusplus

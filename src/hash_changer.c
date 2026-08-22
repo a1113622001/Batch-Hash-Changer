@@ -97,12 +97,33 @@ bool IsRunningAsAdmin(void)
     return isAdmin ? true : false;
 }
 
+// Check if file extension is an executable / driver / signature-sensitive binary
+bool IsExecutableFile(const wchar_t *file_path)
+{
+    if (!file_path) return false;
+    const wchar_t *dot = wcsrchr(file_path, L'.');
+    if (!dot) return false;
+
+    static const wchar_t *kExecExts[] = {
+        L".exe", L".dll", L".sys", L".msi", L".ocx",
+        L".cpl", L".scr", L".efi", L".drv", L".mui",
+        L".ax",  L".com"
+    };
+
+    for (size_t i = 0; i < sizeof(kExecExts) / sizeof(kExecExts[0]); i++)
+    {
+        if (_wcsicmp(dot, kExecExts[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Helper to convert any path to an absolute "\\?\" long path
 static wchar_t* CreatePrefixedPath(const wchar_t *src)
 {
     if (!src || *src == L'\0') return NULL;
 
-    // Already prefixed
     if (wcsncmp(src, L"\\\\?\\", 4) == 0)
     {
         size_t len = wcslen(src);
@@ -133,7 +154,6 @@ static wchar_t* CreatePrefixedPath(const wchar_t *src)
 
     if (fullPath[0] == L'\\' && fullPath[1] == L'\\')
     {
-        // UNC path \\server\share -> \\?\UNC\server\share
         swprintf(prefixed, fullLen + 16, L"\\\\?\\UNC\\%ls", fullPath + 2);
     }
     else
@@ -143,7 +163,7 @@ static wchar_t* CreatePrefixedPath(const wchar_t *src)
     return prefixed;
 }
 
-// Fast thread-safe Random generator using thread ID + QPC seed
+// Fast thread-safe Random generator
 static uint32_t FastRand(void)
 {
     static _Thread_local uint64_t s_rng_state = 0;
@@ -158,6 +178,22 @@ static uint32_t FastRand(void)
     s_rng_state ^= s_rng_state << 25;
     s_rng_state ^= s_rng_state >> 27;
     return (uint32_t)((s_rng_state * 0x2545F4914F6CDD1DULL) >> 32);
+}
+
+// Standard IEEE 802.3 CRC32 Calculation
+static uint32_t CalculateCRC32(const uint8_t *data, size_t length)
+{
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < length; i++)
+    {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++)
+        {
+            if (crc & 1) crc = (crc >> 1) ^ 0xEDB88320;
+            else crc >>= 1;
+        }
+    }
+    return ~crc;
 }
 
 // Query physical cluster (LCN) of a file; returns -1 on failure
@@ -209,12 +245,122 @@ int64_t GetPhysicalClusterLCN(const wchar_t *file_path)
     return lcn;
 }
 
-// Atomically append 1~4 random bytes and freeze/restore FILETIME timestamps
-bool AppendDataWithFreeze(const wchar_t *file_path)
+// Build format-aware injection payload (MP4 free box, PNG tEXt chunk, or generic random noise)
+static size_t BuildFormatPayload(HANDLE hFile, bool format_aware, uint8_t *outPayload, size_t maxPayloadSize)
 {
+    if (!format_aware || maxPayloadSize < 64)
+    {
+        int numBytes = 1 + (FastRand() % 4);
+        for (int i = 0; i < numBytes; i++) {
+            outPayload[i] = (uint8_t)(FastRand() & 0xFF);
+        }
+        return (size_t)numBytes;
+    }
+
+    // Probe file header (first 16 bytes)
+    LARGE_INTEGER liZero = { 0 };
+    LARGE_INTEGER origPos = { 0 };
+    SetFilePointerEx(hFile, liZero, &origPos, FILE_CURRENT);
+
+    SetFilePointerEx(hFile, liZero, NULL, FILE_BEGIN);
+    uint8_t header[16] = { 0 };
+    DWORD readBytes = 0;
+    ReadFile(hFile, header, sizeof(header), &readBytes, NULL);
+    SetFilePointerEx(hFile, origPos, NULL, FILE_BEGIN);
+
+    // 1. MP4 / MOV Container detection (ftyp box at offset 4..7)
+    if (readBytes >= 8 && memcmp(header + 4, "ftyp", 4) == 0)
+    {
+        int noiseBytes = 1 + (FastRand() % 4);
+        uint32_t boxSize = 8 + (uint32_t)noiseBytes;
+
+        outPayload[0] = (uint8_t)((boxSize >> 24) & 0xFF);
+        outPayload[1] = (uint8_t)((boxSize >> 16) & 0xFF);
+        outPayload[2] = (uint8_t)((boxSize >> 8) & 0xFF);
+        outPayload[3] = (uint8_t)(boxSize & 0xFF);
+        outPayload[4] = 'f';
+        outPayload[5] = 'r';
+        outPayload[6] = 'e';
+        outPayload[7] = 'e';
+
+        for (int i = 0; i < noiseBytes; i++) {
+            outPayload[8 + i] = (uint8_t)(FastRand() & 0xFF);
+        }
+        return (size_t)boxSize;
+    }
+
+    // 2. PNG Image detection (\x89PNG\r\n\x1a\n)
+    if (readBytes >= 8 && memcmp(header, "\x89PNG\r\n\x1a\n", 8) == 0)
+    {
+        // Construct PNG tEXt Chunk: Length(4B) + 'tEXt'(4B) + 'Comment\0' + noise + CRC32(4B)
+        static const char kKeyword[] = "Comment";
+        size_t kwLen = 7; // "Comment"
+        int noiseBytes = 1 + (FastRand() % 4);
+        uint32_t dataLen = (uint32_t)(kwLen + 1 + noiseBytes);
+
+        // Length
+        outPayload[0] = (uint8_t)((dataLen >> 24) & 0xFF);
+        outPayload[1] = (uint8_t)((dataLen >> 16) & 0xFF);
+        outPayload[2] = (uint8_t)((dataLen >> 8) & 0xFF);
+        outPayload[3] = (uint8_t)(dataLen & 0xFF);
+
+        // Chunk Type
+        outPayload[4] = 't';
+        outPayload[5] = 'E';
+        outPayload[6] = 'X';
+        outPayload[7] = 't';
+
+        // Data: keyword + null + noise
+        memcpy(outPayload + 8, kKeyword, kwLen);
+        outPayload[8 + kwLen] = '\0';
+        for (int i = 0; i < noiseBytes; i++) {
+            outPayload[8 + kwLen + 1 + i] = (uint8_t)(FastRand() & 0xFF);
+        }
+
+        // Calculate CRC32 over Chunk Type + Data
+        uint32_t crc = CalculateCRC32(outPayload + 4, 4 + dataLen);
+
+        // CRC32 (Big Endian)
+        size_t crcOffset = 8 + dataLen;
+        outPayload[crcOffset + 0] = (uint8_t)((crc >> 24) & 0xFF);
+        outPayload[crcOffset + 1] = (uint8_t)((crc >> 16) & 0xFF);
+        outPayload[crcOffset + 2] = (uint8_t)((crc >> 8) & 0xFF);
+        outPayload[crcOffset + 3] = (uint8_t)(crc & 0xFF);
+
+        return 12 + dataLen;
+    }
+
+    // 3. Generic fallback noise (1~4 bytes)
+    int numBytes = 1 + (FastRand() % 4);
+    for (int i = 0; i < numBytes; i++) {
+        outPayload[i] = (uint8_t)(FastRand() & 0xFF);
+    }
+    return (size_t)numBytes;
+}
+
+// Atomically append noise with signature protection, read-only handling, and timestamp freezing
+bool AppendDataWithFreezeEx(const wchar_t *file_path, bool force_all, bool format_aware, bool *out_skipped)
+{
+    if (out_skipped) *out_skipped = false;
     if (!file_path) return false;
+
+    // 1. Signature protection for Executable files
+    if (!force_all && IsExecutableFile(file_path))
+    {
+        if (out_skipped) *out_skipped = true;
+        return true; // Skipped for safety
+    }
+
     wchar_t *prefixed = CreatePrefixedPath(file_path);
     if (!prefixed) return false;
+
+    // 2. Read-Only Attribute auto-compatibility
+    DWORD origAttrs = GetFileAttributesW(prefixed);
+    bool isReadOnly = (origAttrs != INVALID_FILE_ATTRIBUTES && (origAttrs & FILE_ATTRIBUTE_READONLY));
+    if (isReadOnly)
+    {
+        SetFileAttributesW(prefixed, origAttrs & ~FILE_ATTRIBUTE_READONLY);
+    }
 
     DWORD accessMode = GENERIC_READ | GENERIC_WRITE;
     HANDLE h = CreateFileW(prefixed,
@@ -225,7 +371,6 @@ bool AppendDataWithFreeze(const wchar_t *file_path)
                            FILE_FLAG_BACKUP_SEMANTICS,
                            NULL);
 
-    // Fallback if full access denied: try write & attributes only
     if (h == INVALID_HANDLE_VALUE)
     {
         h = CreateFileW(prefixed,
@@ -239,6 +384,7 @@ bool AppendDataWithFreeze(const wchar_t *file_path)
 
     if (h == INVALID_HANDLE_VALUE)
     {
+        if (isReadOnly) SetFileAttributesW(prefixed, origAttrs);
         free(prefixed);
         return false;
     }
@@ -246,12 +392,9 @@ bool AppendDataWithFreeze(const wchar_t *file_path)
     FILETIME ftCreation, ftLastAccess, ftLastWrite;
     BOOL timesOk = GetFileTime(h, &ftCreation, &ftLastAccess, &ftLastWrite);
 
-    // Generate 1 to 4 random bytes
-    int numBytes = 1 + (FastRand() % 4);
-    BYTE randomData[4];
-    for (int i = 0; i < numBytes; i++) {
-        randomData[i] = (BYTE)(FastRand() & 0xFF);
-    }
+    // Build Payload
+    uint8_t payload[128];
+    size_t payloadLen = BuildFormatPayload(h, format_aware, payload, sizeof(payload));
 
     // Seek to end of file
     LARGE_INTEGER liDistance;
@@ -259,25 +402,238 @@ bool AppendDataWithFreeze(const wchar_t *file_path)
     SetFilePointerEx(h, liDistance, NULL, FILE_END);
 
     DWORD written = 0;
-    BOOL writeOk = WriteFile(h, randomData, (DWORD)numBytes, &written, NULL);
+    BOOL writeOk = WriteFile(h, payload, (DWORD)payloadLen, &written, NULL);
 
-    if (writeOk && written == (DWORD)numBytes)
+    if (writeOk && written == (DWORD)payloadLen)
     {
         if (timesOk)
         {
             SetFileTime(h, &ftCreation, &ftLastAccess, &ftLastWrite);
         }
         CloseHandle(h);
+        if (isReadOnly) SetFileAttributesW(prefixed, origAttrs);
         free(prefixed);
         return true;
     }
 
     CloseHandle(h);
+    if (isReadOnly) SetFileAttributesW(prefixed, origAttrs);
     free(prefixed);
     return false;
 }
 
-// Dynamic array of FileItem
+// Basic wrapper for backward compatibility
+bool AppendDataWithFreeze(const wchar_t *file_path)
+{
+    bool skipped = false;
+    return AppendDataWithFreezeEx(file_path, true, true, &skipped);
+}
+
+// --------------------------------------------------------------------------
+// Streaming Producer-Consumer Concurrent Queue & Pipeline
+// --------------------------------------------------------------------------
+
+#define QUEUE_CAPACITY 8192
+
+typedef struct {
+    wchar_t         *items[QUEUE_CAPACITY];
+    size_t           head;
+    size_t           tail;
+    size_t           count;
+    bool             producer_finished;
+    CRITICAL_SECTION cs;
+    CONDITION_VARIABLE cv_not_empty;
+    CONDITION_VARIABLE cv_not_full;
+} ConcurrentQueue;
+
+static void QueueInit(ConcurrentQueue *q)
+{
+    q->head = 0;
+    q->tail = 0;
+    q->count = 0;
+    q->producer_finished = false;
+    InitializeCriticalSection(&q->cs);
+    InitializeConditionVariable(&q->cv_not_empty);
+    InitializeConditionVariable(&q->cv_not_full);
+}
+
+static void QueuePush(ConcurrentQueue *q, wchar_t *path)
+{
+    EnterCriticalSection(&q->cs);
+    while (q->count == QUEUE_CAPACITY)
+    {
+        SleepConditionVariableCS(&q->cv_not_full, &q->cs, INFINITE);
+    }
+    q->items[q->tail] = path;
+    q->tail = (q->tail + 1) % QUEUE_CAPACITY;
+    q->count++;
+    WakeConditionVariable(&q->cv_not_empty);
+    LeaveCriticalSection(&q->cs);
+}
+
+static wchar_t* QueuePop(ConcurrentQueue *q)
+{
+    EnterCriticalSection(&q->cs);
+    while (q->count == 0 && !q->producer_finished)
+    {
+        SleepConditionVariableCS(&q->cv_not_empty, &q->cs, INFINITE);
+    }
+
+    if (q->count == 0 && q->producer_finished)
+    {
+        LeaveCriticalSection(&q->cs);
+        return NULL; // Queue is empty and producer is done
+    }
+
+    wchar_t *item = q->items[q->head];
+    q->head = (q->head + 1) % QUEUE_CAPACITY;
+    q->count--;
+    WakeConditionVariable(&q->cv_not_full);
+    LeaveCriticalSection(&q->cs);
+    return item;
+}
+
+static void QueueSetFinished(ConcurrentQueue *q)
+{
+    EnterCriticalSection(&q->cs);
+    q->producer_finished = true;
+    WakeAllConditionVariable(&q->cv_not_empty);
+    LeaveCriticalSection(&q->cs);
+}
+
+static void QueueDestroy(ConcurrentQueue *q)
+{
+    DeleteCriticalSection(&q->cs);
+}
+
+// Producer-Consumer Shared Context
+typedef struct {
+    ConcurrentQueue  queue;
+    volatile LONG64  scanned_files;
+    volatile LONG64  processed_files;
+    volatile LONG64  ok_count;
+    volatile LONG64  fail_count;
+    volatile LONG64  skipped_count;
+    volatile LONG64  last_reported;
+    bool             force_all;
+    bool             format_aware;
+    LARGE_INTEGER    perf_freq;
+    LARGE_INTEGER    start_time;
+} PipelineContext;
+
+static void ReportStreamingProgress(PipelineContext *ctx)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsed = (double)(now.QuadPart - ctx->start_time.QuadPart) / (double)ctx->perf_freq.QuadPart;
+
+    int64_t done = ctx->processed_files;
+    int64_t scanned = ctx->scanned_files;
+    double rate = elapsed > 0.001 ? (double)done / elapsed : 0.0;
+
+    printf("[2/3] 流式处理中: 已完成 %lld (扫描中: %lld)  成功 %lld  跳过 %lld  失败 %lld  速率 %.0f 个/秒\n",
+           (long long)done, (long long)scanned, (long long)ctx->ok_count,
+           (long long)ctx->skipped_count, (long long)ctx->fail_count, rate);
+    fflush(stdout);
+}
+
+static DWORD WINAPI StreamingWorkerThreadProc(LPVOID lpParam)
+{
+    PipelineContext *ctx = (PipelineContext*)lpParam;
+
+    while (1)
+    {
+        wchar_t *filePath = QueuePop(&ctx->queue);
+        if (!filePath) break;
+
+        bool skipped = false;
+        bool ok = AppendDataWithFreezeEx(filePath, ctx->force_all, ctx->format_aware, &skipped);
+        free(filePath);
+
+        if (skipped) {
+            InterlockedIncrement64(&ctx->skipped_count);
+        } else if (ok) {
+            InterlockedIncrement64(&ctx->ok_count);
+        } else {
+            InterlockedIncrement64(&ctx->fail_count);
+        }
+
+        LONG64 done = InterlockedIncrement64(&ctx->processed_files);
+        LONG64 last = ctx->last_reported;
+        if (done - last >= 1000)
+        {
+            if (InterlockedCompareExchange64(&ctx->last_reported, done, last) == last)
+            {
+                ReportStreamingProgress(ctx);
+            }
+        }
+    }
+    return 0;
+}
+
+// Producer recursive directory scanner
+static void StreamScanDir(const wchar_t *currentDir, const wchar_t *excludePathNorm, PipelineContext *ctx)
+{
+    wchar_t *prefixedDir = CreatePrefixedPath(currentDir);
+    if (!prefixedDir) return;
+
+    size_t prefLen = wcslen(prefixedDir);
+    wchar_t *searchPattern = (wchar_t*)malloc((prefLen + 16) * sizeof(wchar_t));
+    if (!searchPattern) {
+        free(prefixedDir);
+        return;
+    }
+    swprintf(searchPattern, prefLen + 16, L"%ls\\*", prefixedDir);
+
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(searchPattern, &fd);
+    free(searchPattern);
+    free(prefixedDir);
+
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
+            continue;
+        }
+
+        size_t curDirLen = wcslen(currentDir);
+        size_t fileNameLen = wcslen(fd.cFileName);
+        wchar_t *itemPath = (wchar_t*)malloc((curDirLen + fileNameLen + 8) * sizeof(wchar_t));
+        if (!itemPath) continue;
+
+        swprintf(itemPath, curDirLen + fileNameLen + 8, L"%ls\\%ls", currentDir, fd.cFileName);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            StreamScanDir(itemPath, excludePathNorm, ctx);
+            free(itemPath);
+        }
+        else
+        {
+            // Check against exclude path
+            if (excludePathNorm)
+            {
+                wchar_t fullItem[MAX_PATH * 4];
+                DWORD flen = GetFullPathNameW(itemPath, sizeof(fullItem) / sizeof(wchar_t), fullItem, NULL);
+                if (flen > 0 && _wcsicmp(fullItem, excludePathNorm) == 0)
+                {
+                    free(itemPath);
+                    continue; // Skip excluded file
+                }
+            }
+
+            InterlockedIncrement64(&ctx->scanned_files);
+            QueuePush(&ctx->queue, itemPath);
+        }
+    } while (FindNextFileW(hFind, &fd));
+
+    FindClose(hFind);
+}
+
+// Public API for Directory Scanning (Legacy / Direct)
 typedef struct {
     FileItem *items;
     size_t    count;
@@ -314,25 +670,6 @@ static bool FileItemListAdd(FileItemList *list, const wchar_t *path)
     return true;
 }
 
-// Normalize path for comparison
-static wchar_t* NormalizePathAlloc(const wchar_t *path)
-{
-    if (!path) return NULL;
-    wchar_t fullPath[32768];
-    DWORD len = GetFullPathNameW(path, 32768, fullPath, NULL);
-    if (len == 0 || len >= 32768)
-    {
-        size_t slen = wcslen(path);
-        wchar_t *dup = (wchar_t*)malloc((slen + 1) * sizeof(wchar_t));
-        if (dup) wcscpy(dup, path);
-        return dup;
-    }
-    wchar_t *dup = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
-    if (dup) wcscpy(dup, fullPath);
-    return dup;
-}
-
-// Recursive directory scanner
 static bool ScanDirRecursive(const wchar_t *currentDir, const wchar_t *excludePathNorm, FileItemList *list)
 {
     wchar_t *prefixedDir = CreatePrefixedPath(currentDir);
@@ -352,7 +689,7 @@ static bool ScanDirRecursive(const wchar_t *currentDir, const wchar_t *excludePa
     free(prefixedDir);
 
     if (hFind == INVALID_HANDLE_VALUE) {
-        return true; // Directory empty or inaccessible, continue
+        return true;
     }
 
     do {
@@ -373,19 +710,14 @@ static bool ScanDirRecursive(const wchar_t *currentDir, const wchar_t *excludePa
         }
         else
         {
-            // Check against exclude path
             if (excludePathNorm)
             {
-                wchar_t *itemNorm = NormalizePathAlloc(itemPath);
-                if (itemNorm)
+                wchar_t fullItem[MAX_PATH * 4];
+                DWORD flen = GetFullPathNameW(itemPath, sizeof(fullItem) / sizeof(wchar_t), fullItem, NULL);
+                if (flen > 0 && _wcsicmp(fullItem, excludePathNorm) == 0)
                 {
-                    if (_wcsicmp(itemNorm, excludePathNorm) == 0)
-                    {
-                        free(itemNorm);
-                        free(itemPath);
-                        continue; // Skip excluded file
-                    }
-                    free(itemNorm);
+                    free(itemPath);
+                    continue;
                 }
             }
             FileItemListAdd(list, itemPath);
@@ -397,7 +729,6 @@ static bool ScanDirRecursive(const wchar_t *currentDir, const wchar_t *excludePa
     return true;
 }
 
-// Public directory scanning API
 bool ScanDirectoryFiles(const wchar_t *dir_path, const wchar_t *exclude_path, FileItem **out_items, size_t *out_count)
 {
     if (!dir_path || !out_items || !out_count) return false;
@@ -405,10 +736,15 @@ bool ScanDirectoryFiles(const wchar_t *dir_path, const wchar_t *exclude_path, Fi
     FileItemList list;
     if (!FileItemListInit(&list, 2048)) return false;
 
-    wchar_t *excludeNorm = exclude_path ? NormalizePathAlloc(exclude_path) : NULL;
-    bool ok = ScanDirRecursive(dir_path, excludeNorm, &list);
-    if (excludeNorm) free(excludeNorm);
+    wchar_t excludeNorm[MAX_PATH * 4];
+    bool hasExclude = false;
+    if (exclude_path)
+    {
+        DWORD flen = GetFullPathNameW(exclude_path, sizeof(excludeNorm)/sizeof(wchar_t), excludeNorm, NULL);
+        if (flen > 0) hasExclude = true;
+    }
 
+    bool ok = ScanDirRecursive(dir_path, hasExclude ? excludeNorm : NULL, &list);
     if (!ok)
     {
         FreeFileItems(list.items, list.count);
@@ -431,128 +767,10 @@ void FreeFileItems(FileItem *items, size_t count)
     free(items);
 }
 
-// Comparator for LCN elevator sorting (Ascending order; items with LCN < 0 sorted last)
-static int CompareFileItemsByLcn(const void *a, const void *b)
-{
-    const FileItem *itemA = (const FileItem*)a;
-    const FileItem *itemB = (const FileItem*)b;
+// --------------------------------------------------------------------------
+// Full Batch Streaming Runner
+// --------------------------------------------------------------------------
 
-    int64_t lcnA = (itemA->lcn < 0) ? INT64_MAX : itemA->lcn;
-    int64_t lcnB = (itemB->lcn < 0) ? INT64_MAX : itemB->lcn;
-
-    if (lcnA < lcnB) return -1;
-    if (lcnA > lcnB) return 1;
-    return 0;
-}
-
-// Worker context for parallel processing
-typedef struct {
-    FileItem         *batch_items;
-    size_t            batch_count;
-    volatile LONG     queue_index;
-    volatile LONG64   ok_count;
-    volatile LONG64   fail_count;
-    volatile LONG64   touched_count;
-    volatile LONG64   last_reported;
-    int64_t           total_files;
-    LARGE_INTEGER     perf_freq;
-    LARGE_INTEGER     start_time;
-    bool              query_lcn_phase;
-} BatchContext;
-
-static void ReportProgress(BatchContext *ctx)
-{
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    double elapsed = (double)(now.QuadPart - ctx->start_time.QuadPart) / (double)ctx->perf_freq.QuadPart;
-
-    int64_t done = ctx->touched_count;
-    int64_t total = ctx->total_files;
-    double pct  = total > 0 ? (double)done * 100.0 / (double)total : 0.0;
-    double rate = elapsed > 0.001 ? (double)done / elapsed : 0.0;
-    double eta  = rate > 0.001 ? (double)(total - done) / rate : 0.0;
-
-    printf("[2/3] 进度 %lld/%lld (%.1f%%)  成功 %lld  失败 %lld  速率 %.0f 个/秒  预计剩余 %.0fs\n",
-           (long long)done, (long long)total, pct, (long long)ctx->ok_count, (long long)ctx->fail_count, rate, eta);
-    fflush(stdout);
-}
-
-static DWORD WINAPI WorkerThreadProc(LPVOID lpParam)
-{
-    BatchContext *ctx = (BatchContext*)lpParam;
-    size_t batchCount = ctx->batch_count;
-
-    if (ctx->query_lcn_phase)
-    {
-        while (1)
-        {
-            LONG idx = InterlockedIncrement(&ctx->queue_index) - 1;
-            if (idx >= (LONG)batchCount) break;
-            ctx->batch_items[idx].lcn = GetPhysicalClusterLCN(ctx->batch_items[idx].path);
-        }
-        return 0;
-    }
-
-    while (1)
-    {
-        LONG idx = InterlockedIncrement(&ctx->queue_index) - 1;
-        if (idx >= (LONG)batchCount) break;
-
-        bool ok = AppendDataWithFreeze(ctx->batch_items[idx].path);
-        if (ok) {
-            InterlockedIncrement64(&ctx->ok_count);
-        } else {
-            InterlockedIncrement64(&ctx->fail_count);
-        }
-
-        LONG64 done = InterlockedIncrement64(&ctx->touched_count);
-        LONG64 last = ctx->last_reported;
-        if (done - last >= 1000)
-        {
-            if (InterlockedCompareExchange64(&ctx->last_reported, done, last) == last)
-            {
-                ReportProgress(ctx);
-            }
-        }
-    }
-    return 0;
-}
-
-// Process a batch of files with LCN retrieval, sorting, and parallel execution
-static void ProcessBatch(FileItem *batch_items, size_t batch_count, int threads,
-                         BatchContext *shared_ctx, HANDLE *thread_handles)
-{
-    // Phase 1: Parallel LCN retrieval
-    shared_ctx->batch_items     = batch_items;
-    shared_ctx->batch_count     = batch_count;
-    shared_ctx->queue_index     = 0;
-    shared_ctx->query_lcn_phase = true;
-
-    for (int t = 0; t < threads; t++) {
-        thread_handles[t] = CreateThread(NULL, 0, WorkerThreadProc, shared_ctx, 0, NULL);
-    }
-    WaitForMultipleObjects(threads, thread_handles, TRUE, INFINITE);
-    for (int t = 0; t < threads; t++) {
-        CloseHandle(thread_handles[t]);
-    }
-
-    // Phase 2: Elevator Sort (Ascending by LCN)
-    qsort(batch_items, batch_count, sizeof(FileItem), CompareFileItemsByLcn);
-
-    // Phase 3: Parallel Append & Freeze
-    shared_ctx->queue_index     = 0;
-    shared_ctx->query_lcn_phase = false;
-
-    for (int t = 0; t < threads; t++) {
-        thread_handles[t] = CreateThread(NULL, 0, WorkerThreadProc, shared_ctx, 0, NULL);
-    }
-    WaitForMultipleObjects(threads, thread_handles, TRUE, INFINITE);
-    for (int t = 0; t < threads; t++) {
-        CloseHandle(thread_handles[t]);
-    }
-}
-
-// Run full batch processing
 bool RunBatchHashChanger(const HashChangerOptions *options, HashChangerStats *stats)
 {
     if (!options || !options->target_directory) return false;
@@ -571,72 +789,71 @@ bool RunBatchHashChanger(const HashChangerOptions *options, HashChangerStats *st
     QueryPerformanceFrequency(&perfFreq);
     QueryPerformanceCounter(&startTime);
 
-    FileItem *allItems = NULL;
-    size_t totalCount = 0;
+    PipelineContext ctx;
+    memset(&ctx, 0, sizeof(PipelineContext));
+    QueueInit(&ctx.queue);
+    ctx.force_all    = options->force_all;
+    ctx.format_aware = options->format_aware;
+    ctx.perf_freq    = perfFreq;
+    ctx.start_time   = startTime;
 
-    if (!ScanDirectoryFiles(options->target_directory, options->self_exe_path, &allItems, &totalCount))
+    printf("[1/3] 启动流式流水线：工作线程 %d，签名保护: %s，格式感知: %s\n",
+           threads,
+           options->force_all ? "已禁用(--force-all)" : "已启用(默认保护.exe/.dll)",
+           options->format_aware ? "已启用(MP4/PNG结构感知)" : "通用追加");
+
+    HANDLE *workerHandles = (HANDLE*)malloc(threads * sizeof(HANDLE));
+    if (!workerHandles)
     {
-        SetColorRed();
-        printf("[错误] 扫描目录失败。\n");
-        ResetColor();
+        QueueDestroy(&ctx.queue);
         return false;
     }
 
-    printf("[1/3] 扫描完成：共 %llu 个文件，并行线程 %d\n", (unsigned long long)totalCount, threads);
-    if (totalCount == 0)
-    {
-        printf("没有可处理的文件。\n");
-        FreeFileItems(allItems, totalCount);
-        if (stats) {
-            memset(stats, 0, sizeof(HashChangerStats));
-        }
-        return true;
+    // Launch worker threads
+    for (int t = 0; t < threads; t++) {
+        workerHandles[t] = CreateThread(NULL, 0, StreamingWorkerThreadProc, &ctx, 0, NULL);
     }
 
-    size_t batchSize = options->batch_size > 0 ? (size_t)options->batch_size : 5000;
-
-    BatchContext ctx;
-    memset(&ctx, 0, sizeof(BatchContext));
-    ctx.total_files   = (int64_t)totalCount;
-    ctx.perf_freq     = perfFreq;
-    ctx.start_time    = startTime;
-
-    HANDLE *threadHandles = (HANDLE*)malloc(threads * sizeof(HANDLE));
-    if (!threadHandles)
+    // Producer scans directory on current thread
+    wchar_t excludeNorm[MAX_PATH * 4];
+    bool hasExclude = false;
+    if (options->self_exe_path)
     {
-        FreeFileItems(allItems, totalCount);
-        return false;
+        DWORD flen = GetFullPathNameW(options->self_exe_path, sizeof(excludeNorm)/sizeof(wchar_t), excludeNorm, NULL);
+        if (flen > 0) hasExclude = true;
     }
 
-    for (size_t offset = 0; offset < totalCount; offset += batchSize)
-    {
-        size_t currentBatchCount = totalCount - offset;
-        if (currentBatchCount > batchSize) {
-            currentBatchCount = batchSize;
-        }
+    StreamScanDir(options->target_directory, hasExclude ? excludeNorm : NULL, &ctx);
 
-        ProcessBatch(allItems + offset, currentBatchCount, threads, &ctx, threadHandles);
+    // Producer finished, signal all workers
+    QueueSetFinished(&ctx.queue);
+
+    // Wait for workers to drain the queue and complete
+    WaitForMultipleObjects(threads, workerHandles, TRUE, INFINITE);
+    for (int t = 0; t < threads; t++) {
+        CloseHandle(workerHandles[t]);
     }
+    free(workerHandles);
+    QueueDestroy(&ctx.queue);
 
-    free(threadHandles);
     QueryPerformanceCounter(&endTime);
-
     double elapsed = (double)(endTime.QuadPart - startTime.QuadPart) / (double)perfFreq.QuadPart;
-    double rate = elapsed > 0.0001 ? (double)totalCount / elapsed : 0.0;
+    int64_t total = ctx.processed_files;
+    double rate = elapsed > 0.0001 ? (double)total / elapsed : 0.0;
 
     if (stats)
     {
-        stats->total_files        = (int64_t)totalCount;
+        stats->total_files        = total;
         stats->ok_count           = ctx.ok_count;
         stats->fail_count         = ctx.fail_count;
+        stats->skipped_count      = ctx.skipped_count;
         stats->elapsed_seconds    = elapsed;
         stats->rate_files_per_sec = rate;
     }
 
     printf("\n");
-    printf("[3/3] 处理完成：成功 %lld 个，失败 %lld 个，耗时 %.2f 秒，速率 %.0f 个/秒\n",
-           (long long)ctx.ok_count, (long long)ctx.fail_count, elapsed, rate);
+    printf("[3/3] 处理完成：总计 %lld 个，成功 %lld 个，跳过(签名保护) %lld 个，失败 %lld 个，耗时 %.2f 秒，速率 %.0f 个/秒\n",
+           (long long)total, (long long)ctx.ok_count, (long long)ctx.skipped_count, (long long)ctx.fail_count, elapsed, rate);
 
-    FreeFileItems(allItems, totalCount);
     return true;
 }
