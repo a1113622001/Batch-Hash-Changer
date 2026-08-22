@@ -47,19 +47,19 @@
 
 ```mermaid
 flowchart TD
-    A[选择目标文件夹] --> B[流式枚举文件列表]
-    B --> C[DeviceIoControl 获取物理簇号 LCN]
-    C --> D[按 LCN 物理扇区升序排队 (电梯调度)]
-    D --> E[分配多线程并行写入任务 (Thread Pool)]
+    A["📁 选择目标文件夹"] --> B["📄 流式枚举文件列表"]
+    B --> C["⚙️ DeviceIoControl 获取物理簇号 (LCN)"]
+    C --> D["🛗 按物理扇区升序排队 (电梯调度算法)"]
+    D --> E["⚡ 分配多线程并行写入任务 (Thread Pool)"]
     
-    subgraph Worker [单个文件原子处理流程]
-        E1[GetFileTime 锁定原始时间戳] --> E2[CreateFile 追加 1~4 字节随机噪点]
-        E2 --> E3[SetFileTime 还原原始时间戳]
-        E3 --> E4[释放句柄完成]
+    subgraph Worker ["单个文件原子处理流水线"]
+        E1["🔒 GetFileTime 锁定原始时间戳"] --> E2["✏️ CreateFile 追加 1~4 字节随机噪点"]
+        E2 --> E3["🧊 SetFileTime 还原原始时间戳"]
+        E3 --> E4["🔓 释放文件句柄"]
     end
     
-    E --> Worker
-    Worker --> F[输出处理速率与成功统计]
+    E --> E1
+    E4 --> F["📊 输出处理速率与完成统计看板"]
 ```
 
 ---
