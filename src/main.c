@@ -9,10 +9,11 @@
 static void PrintWideAsUtf8(const wchar_t *wstr)
 {
     if (!wstr) return;
-    char utf8Buf[32768];
-    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, utf8Buf, sizeof(utf8Buf), NULL, NULL);
+    char utf8Buf[4096];
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, utf8Buf, (int)sizeof(utf8Buf), NULL, NULL);
     if (len > 0) {
         fputs(utf8Buf, stdout);
+        fflush(stdout);
     }
 }
 
@@ -150,10 +151,21 @@ int wmain(int argc, wchar_t *argv[])
         if (hIn != INVALID_HANDLE_VALUE)
         {
             DWORD charsRead = 0;
-            if (ReadConsoleW(hIn, targetDir, (sizeof(targetDir) / sizeof(wchar_t)) - 1, &charsRead, NULL) && charsRead > 0)
+            DWORD fileType = GetFileType(hIn);
+            if ((fileType & FILE_TYPE_CHAR) && ReadConsoleW(hIn, targetDir, (sizeof(targetDir) / sizeof(wchar_t)) - 1, &charsRead, NULL))
             {
-                targetDir[charsRead] = L'\0';
-                cleanedDir = TrimQuotesAndSpaces(targetDir);
+                if (charsRead > 0) {
+                    targetDir[charsRead] = L'\0';
+                    cleanedDir = TrimQuotesAndSpaces(targetDir);
+                }
+            }
+            else
+            {
+                // Fallback for piped input or redirected stdin (CI / Scripts / Automation)
+                if (fgetws(targetDir, (int)(sizeof(targetDir) / sizeof(wchar_t)) - 1, stdin))
+                {
+                    cleanedDir = TrimQuotesAndSpaces(targetDir);
+                }
             }
         }
     }
@@ -186,7 +198,7 @@ int wmain(int argc, wchar_t *argv[])
     if (!IsRunningAsAdmin())
     {
         SetColorYellow();
-        printf("提示：建议以管理员身份运行（读取磁盘簇号需要相应权限）。\n");
+        printf("提示：当前为普通用户权限（若需处理受限系统目录建议以管理员身份运行）。\n");
         ResetColor();
     }
 

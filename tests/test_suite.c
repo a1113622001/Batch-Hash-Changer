@@ -406,6 +406,84 @@ static bool TestStreamingPipelineEndToEnd(void)
     return true;
 }
 
+// Test 8: Empty (0-byte) file modification test
+static bool TestEmptyFileModification(void)
+{
+    const wchar_t *testEmpty = L"test_empty_file.dat";
+    TEST_ASSERT(CreateTestFile(testEmpty, NULL, 0), "Create 0-byte file failed");
+
+    char md5Before[64];
+    TEST_ASSERT(CalculateFileMD5(testEmpty, md5Before, sizeof(md5Before)), "Calculate MD5 of empty file failed");
+
+    bool skipped = false;
+    TEST_ASSERT(AppendDataWithFreezeEx(testEmpty, true, true, &skipped), "Append to empty file failed");
+    TEST_ASSERT(!skipped, "Empty file should not be skipped");
+
+    char md5After[64];
+    TEST_ASSERT(CalculateFileMD5(testEmpty, md5After, sizeof(md5After)), "Calculate MD5 after append failed");
+    TEST_ASSERT(strcmp(md5Before, md5After) != 0, "Empty file MD5 must change after noise injection");
+
+    DeleteFileW(testEmpty);
+    return true;
+}
+
+// Test 9: Deep nested directory recursion stack safety test (P0 BUG-02 regression)
+static bool TestDeepDirectoryStackSafety(void)
+{
+    wchar_t deepPath[MAX_PATH * 4] = L"test_deep_dir";
+    CreateDirectoryW(deepPath, NULL);
+
+    wchar_t current[MAX_PATH * 4];
+    wcscpy(current, deepPath);
+
+    // Create 20 levels of nested subdirectories
+    for (int lvl = 0; lvl < 20; lvl++)
+    {
+        swprintf(current + wcslen(current), MAX_PATH * 4 - wcslen(current), L"\\lvl_%d", lvl);
+        CreateDirectoryW(current, NULL);
+    }
+
+    wchar_t deepFile[MAX_PATH * 4];
+    swprintf(deepFile, sizeof(deepFile)/sizeof(wchar_t), L"%ls\\deep_leaf.txt", current);
+    CreateTestFile(deepFile, "Deep Payload", 12);
+
+    HashChangerOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.target_directory = deepPath;
+    opts.threads = 2;
+    opts.force_all = true;
+    opts.format_aware = false;
+
+    HashChangerStats stats;
+    TEST_ASSERT(RunBatchHashChanger(&opts, &stats), "Deep recursive scan must succeed without Stack Overflow");
+    TEST_ASSERT(stats.ok_count == 1, "Deep nested file should be processed");
+
+    // Clean up
+    DeleteFileW(deepFile);
+    for (int lvl = 19; lvl >= 0; lvl--)
+    {
+        RemoveDirectoryW(current);
+        wchar_t *lastSlash = wcsrchr(current, L'\\');
+        if (lastSlash) *lastSlash = L'\0';
+    }
+    RemoveDirectoryW(deepPath);
+    return true;
+}
+
+// Test 10: Directory path rejection in AppendDataWithFreezeEx
+static bool TestDirectoryPathRejection(void)
+{
+    const wchar_t *testDir = L"test_dir_reject";
+    CreateDirectoryW(testDir, NULL);
+
+    bool skipped = false;
+    bool res = AppendDataWithFreezeEx(testDir, true, true, &skipped);
+    TEST_ASSERT(!res, "AppendDataWithFreezeEx must reject directory path");
+
+    RemoveDirectoryW(testDir);
+    return true;
+}
+
 int main(void)
 {
     ConsoleInit();
@@ -420,6 +498,9 @@ int main(void)
     RUN_TEST(TestMp4FormatAwareInjection,         "5. MP4 容器 ISO-BMFF free Box 格式感知注入测试");
     RUN_TEST(TestPngFormatAwareInjection,         "6. PNG 图像 tEXt 辅助 Chunk 格式感知注入测试");
     RUN_TEST(TestStreamingPipelineEndToEnd,       "7. 生产者-消费者流式流水线端到端测试");
+    RUN_TEST(TestEmptyFileModification,           "8. 0 字节空文件哈希修改与注入测试");
+    RUN_TEST(TestDeepDirectoryStackSafety,        "9. 20 层深层嵌套目录递归栈安全测试 (防栈溢出)");
+    RUN_TEST(TestDirectoryPathRejection,          "10. 目录路径非法操作前置拦截测试");
 
     printf("===================================================================\n");
     printf("测试结果: 通过 %d 个, 失败 %d 个\n", g_tests_passed, g_tests_failed);

@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 setlocal enabledelayedexpansion
 
 set "SCRIPT_DIR=%~dp0"
@@ -22,7 +23,7 @@ if %errorlevel% neq 0 (
 
 echo [*] Compiling resource version.rc...
 pushd "%SCRIPT_DIR%src"
-windres version.rc -O coff -o "%BUILD_DIR%\version.res"
+windres -c 65001 version.rc -O coff -o "%BUILD_DIR%\version.res"
 if %errorlevel% neq 0 (
     set "RES_OBJ="
 ) else (
@@ -38,7 +39,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-copy /y "%BIN_DIR%\BatchHashChanger.exe" "%BIN_DIR%\?????????????????exe" >nul
+copy /y "%BIN_DIR%\BatchHashChanger.exe" "%BIN_DIR%\批量文件哈希值修改工具.exe" >nul
 
 echo [*] Compiling test suite test_suite.exe...
 gcc -O2 -Wall -Wextra "%SCRIPT_DIR%src\hash_changer.c" "%SCRIPT_DIR%tests\test_suite.c" -ladvapi32 -lshell32 -o "%BIN_DIR%\test_suite.exe"
@@ -46,5 +47,5 @@ gcc -O2 -Wall -Wextra "%SCRIPT_DIR%src\hash_changer.c" "%SCRIPT_DIR%tests\test_s
 echo =======================================================
 echo   Build Successful!
 echo   Output: %BIN_DIR%\BatchHashChanger.exe
-echo   Output: %BIN_DIR%\?????????????????exe
+echo   Output: %BIN_DIR%\批量文件哈希值修改工具.exe
 echo =======================================================

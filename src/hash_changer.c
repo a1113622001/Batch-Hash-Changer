@@ -132,9 +132,9 @@ static wchar_t* CreatePrefixedPath(const wchar_t *src)
         return dup;
     }
 
-    wchar_t fullPath[32768];
-    DWORD fullLen = GetFullPathNameW(src, 32768, fullPath, NULL);
-    if (fullLen == 0 || fullLen >= 32768)
+    // P0 FIX: Dynamically allocate path buffer to prevent Stack Overflow in recursive calls
+    DWORD requiredLen = GetFullPathNameW(src, 0, NULL, NULL);
+    if (requiredLen == 0)
     {
         size_t len = wcslen(src);
         wchar_t *dup = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
@@ -142,15 +142,27 @@ static wchar_t* CreatePrefixedPath(const wchar_t *src)
         return dup;
     }
 
+    wchar_t *fullPath = (wchar_t*)malloc((requiredLen + 1) * sizeof(wchar_t));
+    if (!fullPath) return NULL;
+
+    DWORD fullLen = GetFullPathNameW(src, requiredLen + 1, fullPath, NULL);
+    if (fullLen == 0)
+    {
+        free(fullPath);
+        return NULL;
+    }
+
     if (wcsncmp(fullPath, L"\\\\?\\", 4) == 0)
     {
-        wchar_t *dup = (wchar_t*)malloc((fullLen + 1) * sizeof(wchar_t));
-        if (dup) wcscpy(dup, fullPath);
-        return dup;
+        return fullPath;
     }
 
     wchar_t *prefixed = (wchar_t*)malloc((fullLen + 16) * sizeof(wchar_t));
-    if (!prefixed) return NULL;
+    if (!prefixed)
+    {
+        free(fullPath);
+        return NULL;
+    }
 
     if (fullPath[0] == L'\\' && fullPath[1] == L'\\')
     {
@@ -160,6 +172,7 @@ static wchar_t* CreatePrefixedPath(const wchar_t *src)
     {
         swprintf(prefixed, fullLen + 16, L"\\\\?\\%ls", fullPath);
     }
+    free(fullPath);
     return prefixed;
 }
 
@@ -356,6 +369,12 @@ bool AppendDataWithFreezeEx(const wchar_t *file_path, bool force_all, bool forma
 
     // 2. Read-Only Attribute auto-compatibility
     DWORD origAttrs = GetFileAttributesW(prefixed);
+    if (origAttrs != INVALID_FILE_ATTRIBUTES && (origAttrs & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        free(prefixed);
+        return false; // Reject directories
+    }
+
     bool isReadOnly = (origAttrs != INVALID_FILE_ATTRIBUTES && (origAttrs & FILE_ATTRIBUTE_READONLY));
     if (isReadOnly)
     {
@@ -503,6 +522,15 @@ static void QueueSetFinished(ConcurrentQueue *q)
 
 static void QueueDestroy(ConcurrentQueue *q)
 {
+    // P1 FIX: Drain and free any remaining items in queue to prevent memory leak
+    while (q->count > 0)
+    {
+        if (q->items[q->head]) {
+            free(q->items[q->head]);
+        }
+        q->head = (q->head + 1) % QUEUE_CAPACITY;
+        q->count--;
+    }
     DeleteCriticalSection(&q->cs);
 }
 
@@ -606,27 +634,27 @@ static void StreamScanDir(const wchar_t *currentDir, const wchar_t *excludePathN
 
         swprintf(itemPath, curDirLen + fileNameLen + 8, L"%ls\\%ls", currentDir, fd.cFileName);
 
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
         {
             StreamScanDir(itemPath, excludePathNorm, ctx);
             free(itemPath);
         }
-        else
+        else if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
         {
             // Check against exclude path
-            if (excludePathNorm)
+            if (excludePathNorm && _wcsicmp(itemPath, excludePathNorm) == 0)
             {
-                wchar_t fullItem[MAX_PATH * 4];
-                DWORD flen = GetFullPathNameW(itemPath, sizeof(fullItem) / sizeof(wchar_t), fullItem, NULL);
-                if (flen > 0 && _wcsicmp(fullItem, excludePathNorm) == 0)
-                {
-                    free(itemPath);
-                    continue; // Skip excluded file
-                }
+                free(itemPath);
+                continue; // Skip excluded file
             }
 
             InterlockedIncrement64(&ctx->scanned_files);
             QueuePush(&ctx->queue, itemPath);
+        }
+        else
+        {
+            free(itemPath);
         }
     } while (FindNextFileW(hFind, &fd));
 
@@ -704,21 +732,17 @@ static bool ScanDirRecursive(const wchar_t *currentDir, const wchar_t *excludePa
 
         swprintf(itemPath, curDirLen + fileNameLen + 8, L"%ls\\%ls", currentDir, fd.cFileName);
 
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
         {
             ScanDirRecursive(itemPath, excludePathNorm, list);
         }
-        else
+        else if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
         {
-            if (excludePathNorm)
+            if (excludePathNorm && _wcsicmp(itemPath, excludePathNorm) == 0)
             {
-                wchar_t fullItem[MAX_PATH * 4];
-                DWORD flen = GetFullPathNameW(itemPath, sizeof(fullItem) / sizeof(wchar_t), fullItem, NULL);
-                if (flen > 0 && _wcsicmp(fullItem, excludePathNorm) == 0)
-                {
-                    free(itemPath);
-                    continue;
-                }
+                free(itemPath);
+                continue;
             }
             FileItemListAdd(list, itemPath);
         }
@@ -784,6 +808,11 @@ bool RunBatchHashChanger(const HashChangerOptions *options, HashChangerStats *st
         if (threads > 8) threads = 8;
         if (threads < 1) threads = 1;
     }
+    // P1 FIX: Clamp threads to MAXIMUM_WAIT_OBJECTS (64)
+    if (threads > MAXIMUM_WAIT_OBJECTS)
+    {
+        threads = MAXIMUM_WAIT_OBJECTS;
+    }
 
     LARGE_INTEGER perfFreq, startTime, endTime;
     QueryPerformanceFrequency(&perfFreq);
@@ -809,9 +838,21 @@ bool RunBatchHashChanger(const HashChangerOptions *options, HashChangerStats *st
         return false;
     }
 
-    // Launch worker threads
+    // Launch worker threads with robust error handling
+    int activeWorkers = 0;
     for (int t = 0; t < threads; t++) {
-        workerHandles[t] = CreateThread(NULL, 0, StreamingWorkerThreadProc, &ctx, 0, NULL);
+        HANDLE hTh = CreateThread(NULL, 0, StreamingWorkerThreadProc, &ctx, 0, NULL);
+        if (hTh != NULL) {
+            workerHandles[activeWorkers++] = hTh;
+        }
+    }
+
+    // P0 FIX: If no worker threads could be created, abort immediately to avoid deadlock
+    if (activeWorkers == 0)
+    {
+        free(workerHandles);
+        QueueDestroy(&ctx.queue);
+        return false;
     }
 
     // Producer scans directory on current thread
@@ -828,9 +869,9 @@ bool RunBatchHashChanger(const HashChangerOptions *options, HashChangerStats *st
     // Producer finished, signal all workers
     QueueSetFinished(&ctx.queue);
 
-    // Wait for workers to drain the queue and complete
-    WaitForMultipleObjects(threads, workerHandles, TRUE, INFINITE);
-    for (int t = 0; t < threads; t++) {
+    // Wait for active workers to drain the queue and complete
+    WaitForMultipleObjects(activeWorkers, workerHandles, TRUE, INFINITE);
+    for (int t = 0; t < activeWorkers; t++) {
         CloseHandle(workerHandles[t]);
     }
     free(workerHandles);
